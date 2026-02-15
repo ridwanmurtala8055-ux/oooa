@@ -1,0 +1,38 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: coinhunter
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - '5432:5432'
+
+  api-core:
+    build: ../
+    working_dir: /workspaces/oooo/apps/api-core
+    command: pnpm --filter @coinhunter/api-core --workspace-root run dev
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/coinhunter
+      WALLET_MASTER_KEY: ${WALLET_MASTER_KEY}
+      PIN_HASH_PEPPER: ${PIN_HASH_PEPPER}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+    depends_on:
+      - postgres
+
+  bot-telegram:
+    build: ../
+    working_dir: /workspaces/oooo/apps/bot-telegram
+    command: pnpm --filter @coinhunter/bot-telegram --workspace-root run dev
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/coinhunter
+    depends_on:
+      - postgres
+
+volumes:
+  pgdata:

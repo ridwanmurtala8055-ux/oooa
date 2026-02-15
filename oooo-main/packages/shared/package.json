@@ -1,0 +1,19 @@
+{
+  "name": "@coinhunter/shared",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@solana/web3.js": "^1.82.0",
+    "argon2": "^0.30.0",
+    "node-fetch": "^3.3.1",
+    "pg": "^8.11.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.16.0",
+    "typescript": "^5.2.2"
+  }
+}

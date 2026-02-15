@@ -1,0 +1,11 @@
+{
+  "name": "api-core",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "dependencies": {
+    "express": "^4.18.2",
+    "dotenv": "^16.3.1",
+    "cors": "^2.8.5",
+    "@coin-hunter/shared": "*"
+  }
+}

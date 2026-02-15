@@ -1,0 +1,178 @@
+You are a senior backend architect and staff-level engineer.
+
+Your task is to implement a complete production-ready system called "Coin Hunter" strictly based on the attached construction.md file.
+
+READ THE FILE:
+Coin_Hunter_Construction_Ultra_Detailed_MD.zip
+Use construction.md inside it as the single source of truth.
+
+Do not skip anything.
+
+----------------------------------------
+CORE RULES
+----------------------------------------
+
+1. Do NOT ask me questions.
+2. Do NOT simplify anything.
+3. Do NOT output partial code.
+4. Implement the entire architecture described.
+5. Follow the custodial encryption model exactly.
+6. Use TypeScript (Node.js).
+7. Use PostgreSQL only.
+8. Implement Jupiter v6 as primary swap route.
+9. Implement Raydium fallback logic.
+10. Implement optional Jito/private relay mode.
+11. Implement subscription gating server-side.
+12. Implement full risk engine enforcement.
+13. Implement Feature 1 exactly like Trojan in flow behavior (but Coin Hunter branding).
+14. Implement Feature 2 (Launch Sniper + Pullback) with full state machines.
+15. Implement Feature 3 (Forex EA bridge with deterministic session engine).
+16. Log every action to audit_logs.
+17. Add idempotency keys for all trade executions.
+
+----------------------------------------
+PROJECT STRUCTURE REQUIRED
+----------------------------------------
+
+Monorepo structure:
+
+/apps
+  /bot-telegram
+  /api-core
+  /engine-solana
+  /engine-forex
+/packages
+  /shared
+/infra
+  docker-compose.yml
+  migrate.sh
+  backup.sh
+
+----------------------------------------
+DATABASE REQUIREMENTS
+----------------------------------------
+
+Use PostgreSQL.
+
+Create versioned migrations.
+
+Implement tables:
+
+- users
+- security_pins
+- subscriptions
+- payments
+- wallets (encrypted keys)
+- terminal_settings
+- meme_sniper_profiles
+- meme_pullback_profiles
+- forex_profiles
+- ea_terminals
+- sol_trades
+- sol_positions
+- forex_signals
+- forex_positions
+- audit_logs
+- engine_events
+
+Add proper indexes.
+
+----------------------------------------
+FEATURE 1 – TERMINAL
+----------------------------------------
+
+Must include:
+
+- Wallet creation (encrypted private keys)
+- Action PIN security
+- Buy flow using Jupiter
+- Raydium fallback
+- Execution modes (Normal/Fast/Turbo/Custom)
+- Shield (private relay)
+- Slippage editor
+- Preset editor
+- Confirm toggle
+- Positions screen
+- Sell flow identical routing logic
+- Limit orders
+- DCA
+- Basic sniper
+- Copy trade
+
+Every screen must have a screen renderer and callback mapping.
+
+----------------------------------------
+FEATURE 2 – MEME BOT
+----------------------------------------
+
+Launch Sniper:
+
+- Detection: DEX pools + pump migration + Jupiter route + volume rules
+- Liquidity filter
+- Holder concentration filter
+- Social link check
+- Probe buy/sell anti-honeypot
+- Emergency liquidity rug exit
+- SL/TP/Trailing/TTL
+- Profit Buffer system
+
+Pullback Scalper:
+
+- Trend detection
+- Pullback confirmation
+- Adaptive volatility layer
+- Auto + Manual entry mode
+- Cooldown
+- Position cap
+
+----------------------------------------
+FEATURE 3 – FOREX BOT
+----------------------------------------
+
+- EA HTTP endpoints:
+  POST /ea/poll
+  POST /ea/report
+
+- Subscription validation
+- Risk validation
+- Session-based engines:
+  Asia (range)
+  London (breakout)
+  NY (continuation)
+
+- Correlation guard
+- Daily drawdown cap
+- Max 2 open positions default
+- Moderate growth profile
+
+----------------------------------------
+SECURITY REQUIREMENTS
+----------------------------------------
+
+- AES-256-GCM wallet encryption
+- Argon2 PIN hashing
+- Environment-based secrets
+- Rate limiting
+- Idempotency
+- Strict entitlement middleware
+
+----------------------------------------
+OUTPUT REQUIREMENT
+----------------------------------------
+
+You must:
+
+1. Generate complete codebase.
+2. Generate all TypeScript files.
+3. Generate Docker compose.
+4. Generate migrations.
+5. Generate README with run instructions.
+6. Generate ASSUMPTIONS.md.
+7. Generate SECURITY.md.
+8. Generate API.md.
+9. Generate DEPLOYMENT.md.
+
+
+
+
+Build it properly.

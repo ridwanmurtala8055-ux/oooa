@@ -1,0 +1,17 @@
+{
+  "name": "@coinhunter/engine-solana",
+  "version": "1.0.0",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/worker.ts",
+    "withdraw-worker": "ts-node-dev --respawn --transpile-only src/withdraw_worker.ts",
+    "build": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "@coinhunter/shared": "file:../../packages/shared",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.2.2"
+  }
+}

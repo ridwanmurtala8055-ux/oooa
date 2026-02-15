@@ -1,0 +1,25 @@
+{
+  "name": "coin-hunter-monorepo",
+  "private": true,
+  "version": "1.0.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "devDependencies": {
+    "nock": "^13.5.6"
+  },
+  "scripts": {
+    "bootstrap": "pnpm install",
+    "start:api": "pnpm --filter @coinhunter/api-core --workspace-root run dev",
+    "start:bot": "pnpm --filter @coinhunter/bot-telegram --workspace-root run dev",
+    "migrate": "sh infra/migrate.sh",
+    "compose:up": "docker-compose -f infra/docker-compose.yml up --build",
+    "test": "node tests/run.js",
+    "test:unit": "node tests/jupiter_extract_unit.js",
+    "test:solana": "node tests/solana_swap_test.js",
+    "devnet:test": "node tests/devnet_integration.js",
+    "check:secrets": "node scripts/check_secrets.js",
+    "unit:test": "node -r ts-node/register tests/shared.test.ts"
+  }
+}
