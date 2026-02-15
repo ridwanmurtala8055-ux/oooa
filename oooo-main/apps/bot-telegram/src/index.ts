@@ -870,8 +870,21 @@ bot.command('security', async (ctx) => {
 
 bot.command('subscribe', async (ctx) => {
   const userId = String(ctx.from?.id || null);
-  await writeAudit(userId, 'telegram.subscribe.view', {});
-  return ctx.reply('Plans: Meme Pro $100, Forex Pro $100, Bundle $170. Use payment flow then /subscriptions/activate API.');
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const plan = parts[1] || null;
+  if (!plan) {
+    await writeAudit(userId, 'telegram.subscribe.view', {});
+    return ctx.reply('Usage: /subscribe <meme|forex|bundle> [months]. Example: /subscribe bundle 1');
+  }
+  const months = Number(parts[2] || 1);
+  const resp = await fetch(`${API_BASE}/subscriptions/activate`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, plan, months, reference: `telegram:${userId}:${Date.now()}` })
+  });
+  const j = await resp.json();
+  if (resp.status !== 200) return ctx.reply('Subscription activation failed: ' + JSON.stringify(j));
+  await writeAudit(userId, 'telegram.subscribe.activate', { plan, months, active_until: j.active_until });
+  return ctx.reply(`Activated ${plan} for ${months} month(s). Active until: ${j.active_until}`);
 });
 
 bot.command('help', async (ctx) => {
@@ -882,32 +895,60 @@ bot.command('help', async (ctx) => {
 
 bot.command('meme', async (ctx) => {
   const userId = String(ctx.from?.id || null);
-  await writeAudit(userId, 'telegram.meme.view', {});
-  return ctx.reply('Meme Pro: Launch sniper + pullback features (requires active meme subscription).');
+  const r = await fetch(`${API_BASE}/subscriptions/status/${userId}`);
+  const j = await r.json();
+  await writeAudit(userId, 'telegram.meme.view', { entitled: !!j?.entitlements?.meme_pro });
+  if (!j?.entitlements?.meme_pro) return ctx.reply('Meme Pro inactive. Use /subscribe meme 1 or /subscribe bundle 1');
+  return ctx.reply('Meme Pro active ✅ Use /launch and /pullback');
 });
 
 bot.command('forex', async (ctx) => {
   const userId = String(ctx.from?.id || null);
-  await writeAudit(userId, 'telegram.forex.view', {});
-  return ctx.reply('Forex Pro: EA bridge signals (requires active forex subscription).');
+  const r = await fetch(`${API_BASE}/subscriptions/status/${userId}`);
+  const j = await r.json();
+  await writeAudit(userId, 'telegram.forex.view', { entitled: !!j?.entitlements?.forex_pro });
+  if (!j?.entitlements?.forex_pro) return ctx.reply('Forex Pro inactive. Use /subscribe forex 1 or /subscribe bundle 1');
+  return ctx.reply('Forex Pro active ✅ Use /bind <terminal_id> <token> [platform]');
 });
 
 bot.command('launch', async (ctx) => {
   const userId = String(ctx.from?.id || null);
-  await writeAudit(userId, 'telegram.launch.view', {});
-  return ctx.reply('Launch Sniper: configure from sniper settings/profile and enable monitoring.');
+  const r = await fetch(`${API_BASE}/subscriptions/status/${userId}`);
+  const j = await r.json();
+  if (!j?.entitlements?.meme_pro) return ctx.reply('Launch requires Meme Pro. Use /subscribe meme 1');
+  const resp = await fetch(`${API_BASE}/sniper/start`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, profile: { mode: 'launch', enabled: true } })
+  });
+  const out = await resp.json();
+  await writeAudit(userId, 'telegram.launch.start', out);
+  return ctx.reply(`Launch sniper started: ${out.id || 'ok'}`);
 });
 
 bot.command('pullback', async (ctx) => {
   const userId = String(ctx.from?.id || null);
-  await writeAudit(userId, 'telegram.pullback.view', {});
-  return ctx.reply('Single Meme Pullback: mode setup is available via profile APIs.');
+  const r = await fetch(`${API_BASE}/subscriptions/status/${userId}`);
+  const j = await r.json();
+  if (!j?.entitlements?.meme_pro) return ctx.reply('Pullback requires Meme Pro. Use /subscribe meme 1');
+  await writeAudit(userId, 'telegram.pullback.start', {});
+  return ctx.reply('Pullback mode set. (Engine-side adaptive pullback remains in progress.)');
 });
 
 bot.command('bind', async (ctx) => {
   const userId = String(ctx.from?.id || null);
-  await writeAudit(userId, 'telegram.bind.view', {});
-  return ctx.reply('EA Bind: register terminal_id + token in ea_terminals, then use /ea/poll and /ea/report.');
+  const parts = ctx.message.text.trim().split(/\s+/);
+  if (parts.length < 3) return ctx.reply('Usage: /bind <terminal_id> <token> [platform]');
+  const terminal_id = parts[1];
+  const token = parts[2];
+  const platform = parts[3] || 'mt5';
+  const r = await fetch(`${API_BASE}/ea/bind`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, terminal_id, token, platform })
+  });
+  const j = await r.json();
+  if (r.status !== 200) return ctx.reply('Bind failed: ' + JSON.stringify(j));
+  await writeAudit(userId, 'telegram.bind.done', { terminal_id, platform });
+  return ctx.reply(`EA terminal bound: ${terminal_id} (${platform})`);
 });
 
 bot.launch().then(() => console.log('Telegram bot started'));
