@@ -814,6 +814,102 @@ bot.command('sell', async (ctx) => {
 // reuse text handler for sell flow
 // In text handler above, add handling
 
+
+
+bot.command('positions', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  const r = await fetch(`${API_BASE}/terminal/positions/${userId}`);
+  const j = await r.json();
+  const positions = j.positions || [];
+  if (positions.length === 0) return ctx.reply('No open positions');
+  const lines = positions.map((p: any, i: number) => `${i + 1}) ${p.mint} qty=${p.qty} entry=${p.entry_price}`);
+  await writeAudit(userId, 'telegram.positions', {});
+  return ctx.reply('Open positions\n' + lines.join('\n'));
+});
+
+bot.command('orders', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  const r = await fetch(`${API_BASE}/orders/${userId}`);
+  const j = await r.json();
+  const orders = j.orders || [];
+  if (orders.length === 0) return ctx.reply('No orders');
+  const lines = orders.map((o: any) => `${o.id} ${o.type} ${o.mint || '-'} ${o.status}`);
+  await writeAudit(userId, 'telegram.orders', {});
+  return ctx.reply('Orders\n' + lines.join('\n'));
+});
+
+bot.command('sniper', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  await writeAudit(userId, 'telegram.sniper.menu', {});
+  return ctx.reply('Sniper menu: use inline menu -> Sniper, or API /sniper/start and /sniper/stop.');
+});
+
+bot.command('copy', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  await writeAudit(userId, 'telegram.copy.menu', {});
+  return ctx.reply('Copy trade: use inline menu -> Copy Trade, or API /copy_trade endpoint.');
+});
+
+bot.command('wallet', async (ctx) => {
+  return bot.handleUpdate({ message: { text: '/wallets', from: ctx.from, chat: (ctx.message as any).chat } } as any, ctx.telegram);
+});
+
+bot.command('settings', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  const r = await fetch(`${API_BASE}/terminal/settings/${userId}`);
+  const j = await r.json();
+  await writeAudit(userId, 'telegram.settings.view', {});
+  return ctx.reply('Settings: ' + JSON.stringify(j.settings || {}));
+});
+
+bot.command('security', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  await writeAudit(userId, 'telegram.security.view', {});
+  return ctx.reply('Security: PIN is required for buy/sell confirmation and withdrawals.');
+});
+
+bot.command('subscribe', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  await writeAudit(userId, 'telegram.subscribe.view', {});
+  return ctx.reply('Plans: Meme Pro $100, Forex Pro $100, Bundle $170. Use payment flow then /subscriptions/activate API.');
+});
+
+bot.command('help', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  await writeAudit(userId, 'telegram.help', {});
+  return ctx.reply('Commands: /menu /buy /sell /positions /orders /sniper /copy /wallet /settings /security /subscribe /meme /forex /launch /pullback /bind');
+});
+
+bot.command('meme', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  await writeAudit(userId, 'telegram.meme.view', {});
+  return ctx.reply('Meme Pro: Launch sniper + pullback features (requires active meme subscription).');
+});
+
+bot.command('forex', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  await writeAudit(userId, 'telegram.forex.view', {});
+  return ctx.reply('Forex Pro: EA bridge signals (requires active forex subscription).');
+});
+
+bot.command('launch', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  await writeAudit(userId, 'telegram.launch.view', {});
+  return ctx.reply('Launch Sniper: configure from sniper settings/profile and enable monitoring.');
+});
+
+bot.command('pullback', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  await writeAudit(userId, 'telegram.pullback.view', {});
+  return ctx.reply('Single Meme Pullback: mode setup is available via profile APIs.');
+});
+
+bot.command('bind', async (ctx) => {
+  const userId = String(ctx.from?.id || null);
+  await writeAudit(userId, 'telegram.bind.view', {});
+  return ctx.reply('EA Bind: register terminal_id + token in ea_terminals, then use /ea/poll and /ea/report.');
+});
+
 bot.launch().then(() => console.log('Telegram bot started'));
 
 process.once('SIGINT', () => bot.stop('SIGINT'));

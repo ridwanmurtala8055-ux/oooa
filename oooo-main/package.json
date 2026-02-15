@@ -20,6 +20,7 @@
     "test:solana": "node tests/solana_swap_test.js",
     "devnet:test": "node tests/devnet_integration.js",
     "check:secrets": "node scripts/check_secrets.js",
-    "unit:test": "node -r ts-node/register tests/shared.test.ts"
+    "unit:test": "TS_NODE_COMPILER_OPTIONS='{\"module\":\"CommonJS\",\"moduleResolution\":\"node\"}' node -r ts-node/register/transpile-only tests/shared.test.cjs",
+    "env:generate": "node scripts/generate_env.js"
   }
 }

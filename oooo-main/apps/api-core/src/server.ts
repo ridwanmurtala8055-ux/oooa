@@ -6,8 +6,45 @@ import { v4 as uuidv4 } from 'uuid';
 const app = express();
 app.use(bodyParser.json());
 
+
+function computeReadiness() {
+  const required = {
+    infrastructure: ['DATABASE_URL'],
+    security: ['WALLET_MASTER_KEY', 'PIN_HASH_PEPPER'],
+    telegram: ['TELEGRAM_BOT_TOKEN'],
+    solana: ['SOLANA_RPC_URL'],
+    execution: ['USE_JUPITER'],
+    forex: ['EA_SHARED_SECRET'],
+    payments: ['PAYMENT_RECEIVER_WALLET']
+  } as const;
+
+  const missing: Record<string, string[]> = {};
+  for (const [group, keys] of Object.entries(required)) {
+    const missed = keys.filter((k) => !(process.env[k] && String(process.env[k]).trim().length > 0));
+    if (missed.length) missing[group] = missed;
+  }
+
+  const warnings: string[] = [];
+  if (process.env.USE_JUPITER !== 'true') warnings.push('USE_JUPITER is not true; swap execution may remain in simulation/fallback mode.');
+  if ((process.env.SHIELD_MODE || 'false') !== 'true') warnings.push('SHIELD_MODE is disabled; private relay MEV protection is off.');
+
+  return {
+    ok: Object.keys(missing).length === 0,
+    missing,
+    warnings,
+    required
+  };
+}
+
 // Health
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// Readiness endpoint for deployment validation
+app.get('/admin/readiness', async (_req, res) => {
+  const readiness = computeReadiness();
+  res.status(readiness.ok ? 200 : 503).json(readiness);
+});
+
 
 // Create user (minimal)
 app.post('/users', async (req, res) => {
@@ -68,7 +105,24 @@ app.get('/terminal/screens/:user_id', async (req, res) => {
     SCREEN_MAIN: { title: 'Terminal', buttons: ['Buy','Sell','Positions','Orders','Wallets','Settings'] },
     SCREEN_BUY_INPUT: { title: 'Buy Token', fields: ['mint'] },
     SCREEN_BUY_PANEL: { title: 'Buy Panel', controls: ['presets','custom_amount','slippage','exec_mode','shield','confirm'] },
-    SCREEN_POSITIONS: { title: 'Positions' }
+    SCREEN_BUY_SETTINGS: { title: 'Buy Settings' },
+    SCREEN_BUY_SLIPPAGE: { title: 'Buy Slippage' },
+    SCREEN_EXECUTION_MODE: { title: 'Execution Mode' },
+    SCREEN_SHIELD_MODE: { title: 'Shield Mode' },
+    SCREEN_BUY_PRESETS: { title: 'Buy Presets' },
+    SCREEN_POSITIONS: { title: 'Positions' },
+    SCREEN_SELL_PANEL: { title: 'Sell Panel' },
+    SCREEN_SELL_SETTINGS: { title: 'Sell Settings' },
+    SCREEN_SELL_SLIPPAGE: { title: 'Sell Slippage' },
+    SCREEN_ORDERS_MAIN: { title: 'Orders' },
+    SCREEN_LIMIT_ORDERS: { title: 'Limit Orders' },
+    SCREEN_DCA_ORDERS: { title: 'DCA Orders' },
+    SCREEN_SNIPER_MAIN: { title: 'Sniper' },
+    SCREEN_COPY_MAIN: { title: 'Copy Trade' },
+    SCREEN_WALLET_MAIN: { title: 'Wallets' },
+    SCREEN_WITHDRAW_FLOW: { title: 'Withdraw' },
+    SCREEN_SECURITY_MAIN: { title: 'Security' },
+    SCREEN_SETTINGS_MAIN: { title: 'Settings' }
   };
   await writeAudit(user_id, 'terminal.screens.view', { screens: Object.keys(screens) });
   res.json({ screens });
