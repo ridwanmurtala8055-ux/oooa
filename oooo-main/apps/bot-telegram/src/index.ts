@@ -503,32 +503,33 @@ bot.on('text', async (ctx) => {
   const s = sessions.get(userId);
   const text = ctx.message.text.trim();
   if (!s) return;
+
+  async function loadTerminalSettings() {
+    const r = await fetch(`${API_BASE}/terminal/settings/${userId}`);
+    const j = await r.json();
+    const settings = j.settings || {};
+    const prefs = settings.presets_json ? (typeof settings.presets_json === 'string' ? JSON.parse(settings.presets_json) : settings.presets_json) : {};
+    return { settings, prefs };
+  }
+
   if (s.step === 'BUY_INPUT') {
     s.data.mint = text;
     s.step = 'BUY_PANEL';
     sessions.set(userId, s);
     await writeAudit(userId, 'telegram.buy.mint', { mint: text });
-    // fetch user presets and show quick-buy buttons
     try {
-      const r = await fetch(`${API_BASE}/terminal/settings/${userId}`);
-      const j = await r.json();
-      const settings = j.settings || {};
-      const prefs = settings.presets_json ? (typeof settings.presets_json === 'string' ? JSON.parse(settings.presets_json) : settings.presets_json) : {};
+      const { settings, prefs } = await loadTerminalSettings();
       const presets: number[] = prefs.buy_presets || (prefs.buy_amount ? [prefs.buy_amount] : []);
       const buttons: any[] = [];
-      for (const p of presets) {
-        buttons.push([Markup.button.callback(`${p} USD`, `buy:preset:${p}`)]);
-      }
-      // add custom and enter manually
+      for (const p of presets) buttons.push([Markup.button.callback(`${p} USD`, `buy:preset:${p}`)]);
       buttons.push([Markup.button.callback('Custom amount', 'buy:custom'), Markup.button.callback('Enter manually', 'buy:manual')]);
       const kb = Markup.inlineKeyboard(buttons);
-      await ctx.reply('Select preset amount or choose Custom:', kb as any);
-      return;
-    } catch (e) {
+      return ctx.reply(`Select amount. Settings: slippage=${settings.buy_slippage_bps ?? 100}bps mode=${settings.exec_mode || 'Normal'} shield=${!!settings.shield_enabled} confirm=${settings.confirm_trades ?? true}`, kb as any);
+    } catch {
       return ctx.reply('Enter buy amount in USD:');
     }
   }
-  // Withdraw amount entry
+
   if (s.step === 'WITHDRAW_AMOUNT') {
     const amount = parseFloat(text);
     if (isNaN(amount) || amount <= 0) return ctx.reply('Invalid amount');
@@ -538,10 +539,10 @@ bot.on('text', async (ctx) => {
     await writeAudit(userId, 'telegram.withdraw.amount', { amount });
     return ctx.reply('Enter destination public key/address for withdrawal:');
   }
+
   if (s.step === 'WITHDRAW_DEST') {
     const dest = text;
     s.data.destination = dest;
-    // fetch estimate from API to show estimated SOL and fee buffer
     try {
       const estRes = await fetch(`${API_BASE}/wallets/${s.data.wallet_id}/estimate?amount_usd=${encodeURIComponent(s.data.amount_usd)}`);
       const est = await estRes.json();
@@ -551,13 +552,14 @@ bot.on('text', async (ctx) => {
       sessions.set(userId, s);
       await writeAudit(userId, 'telegram.withdraw.dest', { destination: dest, estimate: est });
       return ctx.reply(msg + '\n\nSend PIN to confirm withdrawal or type cancel');
-    } catch (e) {
+    } catch {
       s.step = 'WITHDRAW_CONFIRM';
       sessions.set(userId, s);
       await writeAudit(userId, 'telegram.withdraw.dest', { destination: dest });
       return ctx.reply('Send PIN to confirm withdrawal or type cancel');
     }
   }
+
   if (s.step === 'WITHDRAW_CONFIRM') {
     if (text.toLowerCase() === 'cancel') {
       sessions.delete(userId);
@@ -585,6 +587,7 @@ bot.on('text', async (ctx) => {
       return ctx.reply('Withdrawal failed to submit');
     }
   }
+
   if (s.step === 'WALLET_CHOOSE') {
     const idx = parseInt(text, 10) - 1;
     if (isNaN(idx)) return ctx.reply('Invalid selection');
@@ -596,74 +599,72 @@ bot.on('text', async (ctx) => {
     await writeAudit(userId, 'telegram.wallets.choose', { wallet: w.id });
     return ctx.reply('Selected wallet. Now paste token mint address:');
   }
+
   if (s.step === 'BUY_PANEL') {
     const amount = parseFloat(text);
     if (isNaN(amount) || amount <= 0) return ctx.reply('Invalid amount');
     s.data.amount_usd = amount;
-    // request quote
+    const { settings } = await loadTerminalSettings();
+    const slippage = Number(settings.buy_slippage_bps ?? 100);
     const qres = await fetch(`${API_BASE}/terminal/buy/quote`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ inputMint: 'SOL', outputMint: s.data.mint, amount_usd: amount, slippageBps: 100 })
+      body: JSON.stringify({ inputMint: 'SOL', outputMint: s.data.mint, amount_usd: amount, slippageBps: slippage })
     });
     const qjson = await qres.json();
     s.data.quote = qjson.quote;
     s.step = 'BUY_CONFIRM';
     sessions.set(userId, s);
-    await writeAudit(userId, 'telegram.buy.quote', { quote: qjson.quote });
-    return ctx.reply(`Quote: expectedOut=${qjson.quote.expectedOut}, fees=${qjson.quote.fees}. Send PIN to confirm or 'cancel'.`);
+    await writeAudit(userId, 'telegram.buy.quote', { quote: qjson.quote, slippage_bps: slippage });
+    return ctx.reply(`Quote: expectedOut=${qjson.quote.expectedOut}, fees=${qjson.quote.fees}, slippage=${slippage}bps. Send PIN to confirm or 'cancel'.`);
   }
-  // Copy trade input flow
+
   if (s.step === 'COPY_INPUT') {
-    const target = text;
-    // call API to create a copy_trade subscription
+    const parts = text.split(/\s+/);
+    const source = parts[0];
+    const amount = Number(parts[1] || 0);
     try {
-      const resp = await fetch(`${API_BASE}/copy_trade`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: userId, source: target }) });
+      const resp = await fetch(`${API_BASE}/copy_trade`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: userId, source, amount_usd: amount || undefined }) });
       const j = await resp.json();
-      await writeAudit(userId, 'telegram.copy.create', { id: j.id, source: target });
+      await writeAudit(userId, 'telegram.copy.create', { id: j.id, source, amount_usd: amount || null });
       sessions.delete(userId);
-      return ctx.reply(`Copy trade started (id=${j.id}). You'll be notified of executions.`);
-    } catch (e) {
+      return ctx.reply(`Copy trade started (id=${j.id}).`);
+    } catch {
       sessions.delete(userId);
       return ctx.reply('Failed to start copy trade');
     }
   }
 
-  // Fee override input
   if (s.step === 'FEE_INPUT') {
     const v = parseFloat(text);
     if (isNaN(v) || v < 0) return ctx.reply('Invalid fee');
     try {
-      const r = await fetch(`${API_BASE}/terminal/settings/${userId}`);
-      const j = await r.json();
-      const current = j.settings || { presets_json: null };
-      const prefs = current.presets_json ? (typeof current.presets_json === 'string' ? JSON.parse(current.presets_json) : current.presets_json) : {};
+      const { settings, prefs } = await loadTerminalSettings();
       prefs.priority_fee = v;
-      const updated = { ...current, presets_json: JSON.stringify(prefs) };
+      const updated = { ...settings, presets_json: JSON.stringify(prefs) };
       await fetch(`${API_BASE}/terminal/settings/${userId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updated) });
       await writeAudit(userId, 'telegram.settings.fee', { fee: v });
       sessions.delete(userId);
       return ctx.reply(`Fee override set to ${v} SOL`);
-    } catch (e) {
+    } catch {
       sessions.delete(userId);
       return ctx.reply('Failed to save fee override');
     }
   }
 
-  // Watchlist add flow
   if (s.step === 'WATCHLIST_ADD') {
     const mint = text.trim();
     if (!mint) return ctx.reply('Invalid mint');
     try {
-      const resp = await fetch(`${API_BASE}/watchlist/${userId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mint }) });
-      const j = await resp.json();
+      await fetch(`${API_BASE}/watchlist/${userId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ mint }) });
       await writeAudit(userId, 'telegram.watchlist.add', { mint });
       sessions.delete(userId);
       return ctx.reply(`Added ${mint} to watchlist`);
-    } catch (e) {
+    } catch {
       sessions.delete(userId);
       return ctx.reply('Failed to add to watchlist');
     }
   }
+
   if (s.step === 'BUY_CONFIRM') {
     if (text.toLowerCase() === 'cancel') {
       sessions.delete(userId);
@@ -671,12 +672,20 @@ bot.on('text', async (ctx) => {
       return ctx.reply('Buy cancelled');
     }
     const pin = text;
-    // Execute buy
     const idempotencyKey = 'tele:' + userId + ':' + Date.now();
-    const execRes = await fetch(`${API_BASE}/terminal/buy/execute`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_id: userId, wallet_id: null, mint: s.data.mint, amount_usd: s.data.amount_usd, idempotency_key: idempotencyKey, slippage_bps: 100, exec_mode: 'Normal', shield: false, pin })
-    });
+    const { settings } = await loadTerminalSettings();
+    const payload: any = {
+      user_id: userId,
+      wallet_id: s.data.selectedWallet || null,
+      mint: s.data.mint,
+      amount_usd: s.data.amount_usd,
+      idempotency_key: idempotencyKey,
+      slippage_bps: Number(settings.buy_slippage_bps ?? 100),
+      exec_mode: settings.exec_mode || 'Normal',
+      shield: !!settings.shield_enabled
+    };
+    if (settings.confirm_trades !== false) payload.pin = pin;
+    const execRes = await fetch(`${API_BASE}/terminal/buy/execute`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const execJson = await execRes.json();
     if (execRes.status !== 200) {
       await writeAudit(userId, 'telegram.buy.execute.failed', { err: execJson });
@@ -687,7 +696,7 @@ bot.on('text', async (ctx) => {
     sessions.delete(userId);
     return ctx.reply(`Buy queued: tradeId=${execJson.tradeId}. Use /status ${execJson.tradeId} to check.`);
   }
-  // Sell flow continuation
+
   if (s.step === 'SELL_CHOOSE_POS') {
     const idx = parseInt(text, 10) - 1;
     if (isNaN(idx)) return ctx.reply('Invalid selection');
@@ -699,8 +708,10 @@ bot.on('text', async (ctx) => {
     await writeAudit(userId, 'telegram.sell.choose', { position: pos.id });
     return ctx.reply('Enter percent to sell (25/50/75/100 or custom):');
   }
+
   if (s.step === 'SELL_PERCENT') {
-    const pct = parseFloat(text);
+    const aliases: any = { quarter: 25, half: 50, all: 100 };
+    const pct = aliases[text.toLowerCase()] ?? parseFloat(text);
     if (isNaN(pct) || pct <= 0 || pct > 100) return ctx.reply('Invalid percent');
     s.data.percent = pct;
     s.step = 'SELL_CONFIRM';
@@ -708,14 +719,38 @@ bot.on('text', async (ctx) => {
     await writeAudit(userId, 'telegram.sell.percent', { percent: pct });
     return ctx.reply('Send PIN to confirm sell or type cancel');
   }
+
   if (s.step === 'SELL_CONFIRM') {
     if (text.toLowerCase() === 'cancel') {
       sessions.delete(userId);
       await writeAudit(userId, 'telegram.sell.cancel', {});
       return ctx.reply('Sell cancelled');
     }
+    const pin = text;
+    const idempotencyKey = 'tele:sell:' + userId + ':' + Date.now();
+    const { settings } = await loadTerminalSettings();
+    const payload: any = {
+      user_id: userId,
+      position_id: s.data.chosen.id,
+      percent: s.data.percent,
+      idempotency_key: idempotencyKey,
+      slippage_bps: Number(settings.sell_slippage_bps ?? 100),
+      exec_mode: settings.exec_mode || 'Normal',
+      shield: !!settings.shield_enabled
+    };
+    if (settings.confirm_trades !== false) payload.pin = pin;
+    const execRes = await fetch(`${API_BASE}/terminal/sell/execute`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const execJson = await execRes.json();
+    if (execRes.status !== 200) {
+      await writeAudit(userId, 'telegram.sell.execute.failed', { err: execJson });
+      sessions.delete(userId);
+      return ctx.reply('Sell failed: ' + JSON.stringify(execJson));
+    }
+    await writeAudit(userId, 'telegram.sell.execute', { tradeId: execJson.tradeId });
+    sessions.delete(userId);
+    return ctx.reply(`Sell queued: tradeId=${execJson.tradeId}. Use /status ${execJson.tradeId} to check.`);
+  }
 
-  // custom buy entered amount flow
   if (s.step === 'BUY_CUSTOM') {
     const amount = parseFloat(text);
     if (isNaN(amount) || amount <= 0) return ctx.reply('Invalid amount');
@@ -728,31 +763,35 @@ bot.on('text', async (ctx) => {
 
   if (s.step === 'BUY_CUSTOM_SAVE_PROMPT') {
     if (text.toLowerCase() === 'save') {
-      // save preset
       try {
-        const r = await fetch(`${API_BASE}/terminal/settings/${userId}`);
-        const j = await r.json();
-        const current = j.settings || { presets_json: null };
-        const prefs = current.presets_json ? (typeof current.presets_json === 'string' ? JSON.parse(current.presets_json) : current.presets_json) : {};
+        const { settings, prefs } = await loadTerminalSettings();
         prefs.buy_presets = prefs.buy_presets || [];
         if (!prefs.buy_presets.includes(s.data.amount_usd)) prefs.buy_presets.push(s.data.amount_usd);
-        const updated = { ...current, presets_json: JSON.stringify(prefs) };
+        const updated = { ...settings, presets_json: JSON.stringify(prefs) };
         await fetch(`${API_BASE}/terminal/settings/${userId}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(updated) });
         await writeAudit(userId, 'telegram.buy.preset_saved', { amount: s.data.amount_usd });
         s.step = 'BUY_CONFIRM';
         sessions.set(userId, s);
         return ctx.reply(`Saved preset ${s.data.amount_usd} and ready. Send PIN to confirm buy.`);
-      } catch (e) {
+      } catch {
         return ctx.reply('Failed to save preset');
       }
     }
-    // assume text is PIN -> proceed to execute buy
     const pin = text;
     const idempotencyKey = 'tele:' + userId + ':' + Date.now();
-    const execRes = await fetch(`${API_BASE}/terminal/buy/execute`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_id: userId, wallet_id: s.data.selectedWallet || null, mint: s.data.mint, amount_usd: s.data.amount_usd, idempotency_key: idempotencyKey, slippage_bps: 100, exec_mode: 'Normal', shield: false, pin })
-    });
+    const { settings } = await loadTerminalSettings();
+    const payload: any = {
+      user_id: userId,
+      wallet_id: s.data.selectedWallet || null,
+      mint: s.data.mint,
+      amount_usd: s.data.amount_usd,
+      idempotency_key: idempotencyKey,
+      slippage_bps: Number(settings.buy_slippage_bps ?? 100),
+      exec_mode: settings.exec_mode || 'Normal',
+      shield: !!settings.shield_enabled
+    };
+    if (settings.confirm_trades !== false) payload.pin = pin;
+    const execRes = await fetch(`${API_BASE}/terminal/buy/execute`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const execJson = await execRes.json();
     if (execRes.status !== 200) {
       await writeAudit(userId, 'telegram.buy.execute.failed', { err: execJson });
@@ -762,22 +801,6 @@ bot.on('text', async (ctx) => {
     await writeAudit(userId, 'telegram.buy.execute', { tradeId: execJson.tradeId });
     sessions.delete(userId);
     return ctx.reply(`Buy queued: tradeId=${execJson.tradeId}. Use /status ${execJson.tradeId} to check.`);
-  }
-    const pin = text;
-    const idempotencyKey = 'tele:sell:' + userId + ':' + Date.now();
-    const execRes = await fetch(`${API_BASE}/terminal/sell/execute`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ user_id: userId, position_id: s.data.chosen.id, percent: s.data.percent, idempotency_key: idempotencyKey, slippage_bps: 100, exec_mode: 'Normal', shield: false, pin })
-    });
-    const execJson = await execRes.json();
-    if (execRes.status !== 200) {
-      await writeAudit(userId, 'telegram.sell.execute.failed', { err: execJson });
-      sessions.delete(userId);
-      return ctx.reply('Sell failed: ' + JSON.stringify(execJson));
-    }
-    await writeAudit(userId, 'telegram.sell.execute', { tradeId: execJson.tradeId });
-    sessions.delete(userId);
-    return ctx.reply(`Sell queued: tradeId=${execJson.tradeId}. Use /status ${execJson.tradeId} to check.`);
   }
 });
 
@@ -840,14 +863,41 @@ bot.command('orders', async (ctx) => {
 
 bot.command('sniper', async (ctx) => {
   const userId = String(ctx.from?.id || null);
-  await writeAudit(userId, 'telegram.sniper.menu', {});
-  return ctx.reply('Sniper menu: use inline menu -> Sniper, or API /sniper/start and /sniper/stop.');
+  const parts = ctx.message.text.trim().split(/\s+/);
+  const action = (parts[1] || '').toLowerCase();
+  if (!action) return ctx.reply('Usage: /sniper <start|stop> [amount_usd] [slippage_bps] [fee] [autosell:true|false] [migration:true|false]');
+  if (action === 'stop') {
+    await fetch(`${API_BASE}/sniper/stop`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: userId }) });
+    await writeAudit(userId, 'telegram.sniper.stop', {});
+    return ctx.reply('Sniper stopped');
+  }
+  const amount_usd = Number(parts[2] || 10);
+  const slippage_bps = Number(parts[3] || 1500);
+  const fee = Number(parts[4] || 0);
+  const autosell = (parts[5] || 'false') === 'true';
+  const migration = (parts[6] || 'false') === 'true';
+  const profile = { amount_usd, slippage_bps, fee, autosell, migration };
+  const resp = await fetch(`${API_BASE}/sniper/start`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ user_id: userId, profile }) });
+  const j = await resp.json();
+  await writeAudit(userId, 'telegram.sniper.start', profile);
+  return ctx.reply(`Sniper started: ${j.id || 'ok'} with ${JSON.stringify(profile)}`);
 });
 
 bot.command('copy', async (ctx) => {
   const userId = String(ctx.from?.id || null);
-  await writeAudit(userId, 'telegram.copy.menu', {});
-  return ctx.reply('Copy trade: use inline menu -> Copy Trade, or API /copy_trade endpoint.');
+  const parts = ctx.message.text.trim().split(/\s+/);
+  if (parts.length < 2) return ctx.reply('Usage: /copy <source_wallet_or_id> [amount_usd] [mint]');
+  const source = parts[1];
+  const amount_usd = Number(parts[2] || 0);
+  const mint = parts[3] || null;
+  const resp = await fetch(`${API_BASE}/copy_trade`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user_id: userId, source, amount_usd: amount_usd || undefined, mint })
+  });
+  const j = await resp.json();
+  if (resp.status !== 200) return ctx.reply('Copy trade failed: ' + JSON.stringify(j));
+  await writeAudit(userId, 'telegram.copy.create', { source, amount_usd, mint, id: j.id });
+  return ctx.reply(`Copy trade created: ${j.id}`);
 });
 
 bot.command('wallet', async (ctx) => {
