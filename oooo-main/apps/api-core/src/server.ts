@@ -1,37 +1,256 @@
 import express from 'express';
 import bodyParser from 'body-parser';
-import { query, writeAudit, encryptPrivateKey, decryptPrivateKey, hashPin, verifyPin, enforceAll, getTradingCapital, getBalancePublicKey, getSolPriceUsd, estimateTransferFee } from '@coinhunter/shared';
+import { query, writeAudit, encryptPrivateKey, decryptPrivateKey, hashPin, verifyPin, enforceAll, getTradingCapital, getBalancePublicKey, getSolPriceUsd, estimateTransferFee, getJupiterQuote } from '@coinhunter/shared';
 import { v4 as uuidv4 } from 'uuid';
+import { Keypair } from '@solana/web3.js';
+import bs58 from 'bs58';
+import crypto from 'crypto';
 
 const app = express();
 app.use(bodyParser.json());
+const SUBSCRIPTION_PRICES: Record<string, number> = {
+  meme: 100,
+  forex: 100,
+  bundle: 170
+};
+
+function normalizePlan(plan: any): 'meme' | 'forex' | 'bundle' | null {
+  const v = String(plan || '').trim().toLowerCase();
+  if (v === 'meme' || v === 'forex' || v === 'bundle') return v;
+  return null;
+}
+
+
+function isDevnetCluster() {
+  return String(process.env.SOLANA_CLUSTER || '').toLowerCase() === 'devnet';
+}
+
+
+function computeReadiness() {
+  const required = {
+    infrastructure: ['DATABASE_URL'],
+    security: ['WALLET_MASTER_KEY', 'PIN_HASH_PEPPER'],
+    telegram: ['TELEGRAM_BOT_TOKEN'],
+    solana: ['SOLANA_RPC_URL'],
+    execution: ['USE_JUPITER'],
+    forex: ['EA_SHARED_SECRET'],
+    payments: ['PAYMENT_RECEIVER_WALLET']
+  } as const;
+
+  const missing: Record<string, string[]> = {};
+  for (const [group, keys] of Object.entries(required)) {
+    const missed = keys.filter((k) => !(process.env[k] && String(process.env[k]).trim().length > 0));
+    if (missed.length) missing[group] = missed;
+  }
+
+  const warnings: string[] = [];
+  if (process.env.USE_JUPITER !== 'true') warnings.push('USE_JUPITER is not true; swap execution may remain in simulation/fallback mode.');
+  if ((process.env.SHIELD_MODE || 'false') !== 'true') warnings.push('SHIELD_MODE is disabled; private relay MEV protection is off.');
+
+  return {
+    ok: Object.keys(missing).length === 0,
+    missing,
+    warnings,
+    required
+  };
+}
+
+async function canReachDatabase() {
+  try {
+    await query('SELECT 1');
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+
+function parsePrivateKey(input: any) {
+  if (!input) throw new Error('private_key_required');
+  let bytes: Buffer | null = null;
+  if (Array.isArray(input)) {
+    bytes = Buffer.from(input.map((v) => Number(v)));
+  } else {
+    const raw = String(input).trim();
+    if (raw.startsWith('[') && raw.endsWith(']')) {
+      try {
+        const arr = JSON.parse(raw);
+        if (Array.isArray(arr)) bytes = Buffer.from(arr.map((v: any) => Number(v)));
+      } catch {}
+    }
+    if (!bytes) {
+      try {
+        const b64 = Buffer.from(raw, 'base64');
+        if (b64.length === 32 || b64.length === 64) bytes = b64;
+      } catch {}
+    }
+    if (!bytes) {
+      try {
+        const b58 = Buffer.from(bs58.decode(raw));
+        if (b58.length === 32 || b58.length === 64) bytes = b58;
+      } catch {}
+    }
+  }
+  if (!bytes || (bytes.length !== 32 && bytes.length !== 64)) throw new Error('invalid_private_key_format');
+  return bytes;
+}
+
+function deriveSolanaKeypairFromMnemonic(mnemonic: string, passphrase = '', account = 0, index = 0) {
+  const words = String(mnemonic || '').trim().toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length !== 12 && words.length !== 24) throw new Error('mnemonic_must_be_12_or_24_words');
+  const normalized = words.join(' ');
+  const seed = crypto.pbkdf2Sync(normalized, `mnemonic${passphrase || ''}`, 2048, 64, 'sha512');
+  const root = crypto.createHmac('sha512', 'ed25519 seed').update(seed).digest();
+  let key = root.subarray(0, 32);
+  let chain = root.subarray(32);
+  const path = [44, 501, Number(account || 0), Number(index || 0)];
+  for (const seg of path) {
+    const idx = (seg | 0) + 0x80000000;
+    const data = Buffer.alloc(1 + 32 + 4);
+    data[0] = 0;
+    key.copy(data, 1);
+    data.writeUInt32BE(idx >>> 0, 33);
+    const digest = crypto.createHmac('sha512', chain).update(data).digest();
+    key = digest.subarray(0, 32);
+    chain = digest.subarray(32);
+  }
+  return Keypair.fromSeed(Uint8Array.from(key));
+}
 
 // Health
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
-// Create user (minimal)
-app.post('/users', async (req, res) => {
-  const { telegram_id } = req.body;
-  const id = uuidv4();
-  await query('INSERT INTO users(id, telegram_id, status, created_at) VALUES($1,$2,$3,now())', [id, telegram_id, 'active']);
-  await writeAudit(id, 'user.create', { telegram_id });
-  res.json({ id });
+// Readiness endpoint for deployment validation
+app.get('/admin/readiness', async (_req, res) => {
+  const readiness = computeReadiness();
+  const dbOk = await canReachDatabase();
+  if (!dbOk) readiness.warnings.push('DATABASE_URL is set but database is not reachable.');
+  const ok = readiness.ok && dbOk;
+  res.status(ok ? 200 : 503).json({ ...readiness, ok, checks: { database: dbOk } });
 });
 
-// Wallet create (custodial) - accepts base64 private key
+
+// Create user (minimal)
+app.post('/users', async (req, res) => {
+  try {
+    const { telegram_id } = req.body;
+    const id = uuidv4();
+    await query('INSERT INTO users(id, telegram_id, status, created_at) VALUES($1,$2,$3,now())', [id, telegram_id, 'active']);
+    await writeAudit(id, 'user.create', { telegram_id });
+    res.json({ id });
+  } catch (e: any) {
+    res.status(503).json({ error: 'database_unavailable', detail: String(e?.message || e) });
+  }
+});
+
+
+// Security PIN management
+app.post('/security/pin/set', async (req, res) => {
+  try {
+    const { user_id, pin } = req.body;
+    if (!user_id || !pin || String(pin).length < 4) return res.status(400).json({ error: 'pin_min_length_4' });
+    const hp = await hashPin(String(pin));
+    await query('INSERT INTO security_pins(user_id,pin_hash,salt,created_at) VALUES($1,$2,$3,now()) ON CONFLICT (user_id) DO UPDATE SET pin_hash=EXCLUDED.pin_hash, salt=EXCLUDED.salt, created_at=now()', [user_id, hp.hash, hp.salt]);
+    await writeAudit(user_id, 'security.pin.set', {});
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(400).json({ error: e?.message || String(e) });
+  }
+});
+
+app.post('/security/pin/change', async (req, res) => {
+  try {
+    const { user_id, old_pin, new_pin } = req.body;
+    if (!user_id || !old_pin || !new_pin || String(new_pin).length < 4) return res.status(400).json({ error: 'invalid_pin_change_payload' });
+    const sp = await query('SELECT pin_hash, salt FROM security_pins WHERE user_id=$1', [user_id]);
+    if (sp.rowCount === 0) return res.status(404).json({ error: 'pin_not_set' });
+    const ok = await verifyPin(String(old_pin), sp.rows[0].salt, sp.rows[0].pin_hash);
+    if (!ok) return res.status(403).json({ error: 'pin_invalid' });
+    const hp = await hashPin(String(new_pin));
+    await query('UPDATE security_pins SET pin_hash=$1,salt=$2,created_at=now() WHERE user_id=$3', [hp.hash, hp.salt, user_id]);
+    await writeAudit(user_id, 'security.pin.change', {});
+    res.json({ ok: true });
+  } catch (e: any) {
+    res.status(400).json({ error: e?.message || String(e) });
+  }
+});
+
+app.post('/security/pin/verify', async (req, res) => {
+  try {
+    const { user_id, pin } = req.body;
+    if (!user_id || !pin) return res.status(400).json({ error: 'user_id_pin_required' });
+    const sp = await query('SELECT pin_hash, salt FROM security_pins WHERE user_id=$1', [user_id]);
+    if (sp.rowCount === 0) return res.status(404).json({ error: 'pin_not_set' });
+    const ok = await verifyPin(String(pin), sp.rows[0].salt, sp.rows[0].pin_hash);
+    await writeAudit(user_id, 'security.pin.verify', { ok });
+    res.status(ok ? 200 : 403).json({ ok });
+  } catch (e: any) {
+    res.status(400).json({ error: e?.message || String(e) });
+  }
+});
+
+// Wallet create/import (custodial)
 app.post('/wallets', async (req, res) => {
-  const { user_id, label, privkey_b64 } = req.body;
-  const raw = Buffer.from(privkey_b64, 'base64');
-  const walletId = uuidv4();
-  const aad = Buffer.from(`${walletId}:${user_id}`);
-  const { ciphertext, iv, tag } = encryptPrivateKey(raw, aad);
-  await query(
-    `INSERT INTO wallets(id, user_id, label, pubkey, enc_privkey, enc_iv, enc_tag, is_active, created_at)
-     VALUES($1,$2,$3,$4,$5,$6,$7,true,now())`,
-    [walletId, user_id, label, null, ciphertext.toString('base64'), iv.toString('base64'), tag.toString('base64')]
-  );
-  await writeAudit(user_id, 'wallet.create', { walletId, label });
-  res.json({ walletId });
+  try {
+    const { user_id, label, privkey_b64, set_active = true } = req.body;
+    let kp: Keypair;
+    if (privkey_b64) {
+      const raw = Buffer.from(privkey_b64, 'base64');
+      if (raw.length === 64) kp = Keypair.fromSecretKey(Uint8Array.from(raw));
+      else if (raw.length === 32) kp = Keypair.fromSeed(Uint8Array.from(raw));
+      else return res.status(400).json({ error: 'invalid_privkey_b64_length' });
+    } else {
+      kp = Keypair.generate();
+    }
+
+    const walletId = uuidv4();
+    const aad = Buffer.from(`${walletId}:${user_id}`);
+    const secret = Buffer.from(kp.secretKey);
+    const { ciphertext, iv, tag } = encryptPrivateKey(secret, aad);
+    secret.fill(0);
+    if (set_active) await query('UPDATE wallets SET is_active=false WHERE user_id=$1', [user_id]);
+    await query(
+      `INSERT INTO wallets(id, user_id, label, pubkey, enc_privkey, enc_iv, enc_tag, is_active, created_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,now())`,
+      [walletId, user_id, label || 'wallet', kp.publicKey.toBase58(), ciphertext.toString('base64'), iv.toString('base64'), tag.toString('base64'), !!set_active]
+    );
+    await writeAudit(user_id, 'wallet.create', { walletId, label, pubkey: kp.publicKey.toBase58(), set_active: !!set_active });
+    res.json({ walletId, pubkey: kp.publicKey.toBase58(), created: true });
+  } catch (e: any) {
+    res.status(400).json({ error: e?.message || String(e) });
+  }
+});
+
+app.post('/wallets/import', async (req, res) => {
+  try {
+    const { user_id, label, import_type, private_key, mnemonic, passphrase = '', account = 0, index = 0, set_active = true } = req.body;
+    let kp: Keypair;
+    if (import_type === 'private_key') {
+      const raw = parsePrivateKey(private_key);
+      kp = raw.length === 64 ? Keypair.fromSecretKey(Uint8Array.from(raw)) : Keypair.fromSeed(Uint8Array.from(raw));
+      raw.fill(0);
+    } else if (import_type === 'mnemonic') {
+      kp = deriveSolanaKeypairFromMnemonic(String(mnemonic || ''), String(passphrase || ''), Number(account || 0), Number(index || 0));
+    } else {
+      return res.status(400).json({ error: 'import_type_must_be_private_key_or_mnemonic' });
+    }
+
+    const walletId = uuidv4();
+    const aad = Buffer.from(`${walletId}:${user_id}`);
+    const secret = Buffer.from(kp.secretKey);
+    const { ciphertext, iv, tag } = encryptPrivateKey(secret, aad);
+    secret.fill(0);
+    if (set_active) await query('UPDATE wallets SET is_active=false WHERE user_id=$1', [user_id]);
+    await query(
+      `INSERT INTO wallets(id, user_id, label, pubkey, enc_privkey, enc_iv, enc_tag, is_active, created_at)
+       VALUES($1,$2,$3,$4,$5,$6,$7,$8,now())`,
+      [walletId, user_id, label || `imported-${import_type}`, kp.publicKey.toBase58(), ciphertext.toString('base64'), iv.toString('base64'), tag.toString('base64'), !!set_active]
+    );
+    await writeAudit(user_id, 'wallet.import', { walletId, import_type, pubkey: kp.publicKey.toBase58(), account: Number(account || 0), index: Number(index || 0), set_active: !!set_active });
+    res.json({ walletId, pubkey: kp.publicKey.toBase58(), imported: true, import_type });
+  } catch (e: any) {
+    res.status(400).json({ error: e?.message || String(e) });
+  }
 });
 
 // Admin: create meme candidate (for testing/demo)
@@ -68,7 +287,24 @@ app.get('/terminal/screens/:user_id', async (req, res) => {
     SCREEN_MAIN: { title: 'Terminal', buttons: ['Buy','Sell','Positions','Orders','Wallets','Settings'] },
     SCREEN_BUY_INPUT: { title: 'Buy Token', fields: ['mint'] },
     SCREEN_BUY_PANEL: { title: 'Buy Panel', controls: ['presets','custom_amount','slippage','exec_mode','shield','confirm'] },
-    SCREEN_POSITIONS: { title: 'Positions' }
+    SCREEN_BUY_SETTINGS: { title: 'Buy Settings' },
+    SCREEN_BUY_SLIPPAGE: { title: 'Buy Slippage' },
+    SCREEN_EXECUTION_MODE: { title: 'Execution Mode' },
+    SCREEN_SHIELD_MODE: { title: 'Shield Mode' },
+    SCREEN_BUY_PRESETS: { title: 'Buy Presets' },
+    SCREEN_POSITIONS: { title: 'Positions' },
+    SCREEN_SELL_PANEL: { title: 'Sell Panel' },
+    SCREEN_SELL_SETTINGS: { title: 'Sell Settings' },
+    SCREEN_SELL_SLIPPAGE: { title: 'Sell Slippage' },
+    SCREEN_ORDERS_MAIN: { title: 'Orders' },
+    SCREEN_LIMIT_ORDERS: { title: 'Limit Orders' },
+    SCREEN_DCA_ORDERS: { title: 'DCA Orders' },
+    SCREEN_SNIPER_MAIN: { title: 'Sniper' },
+    SCREEN_COPY_MAIN: { title: 'Copy Trade' },
+    SCREEN_WALLET_MAIN: { title: 'Wallets' },
+    SCREEN_WITHDRAW_FLOW: { title: 'Withdraw' },
+    SCREEN_SECURITY_MAIN: { title: 'Security' },
+    SCREEN_SETTINGS_MAIN: { title: 'Settings' }
   };
   await writeAudit(user_id, 'terminal.screens.view', { screens: Object.keys(screens) });
   res.json({ screens });
@@ -103,6 +339,23 @@ app.get('/wallets/:user_id', async (req, res) => {
   }
   await writeAudit(user_id, 'wallets.list', {});
   res.json({ wallets });
+});
+
+
+app.post('/wallets/:wallet_id/activate', async (req, res) => {
+  try {
+    const { wallet_id } = req.params;
+    const { user_id } = req.body;
+    if (!user_id) return res.status(400).json({ error: 'user_id_required' });
+    const own = await query('SELECT id FROM wallets WHERE id=$1 AND user_id=$2', [wallet_id, user_id]);
+    if (own.rowCount === 0) return res.status(404).json({ error: 'wallet_not_found' });
+    await query('UPDATE wallets SET is_active=false WHERE user_id=$1', [user_id]);
+    await query('UPDATE wallets SET is_active=true WHERE id=$1', [wallet_id]);
+    await writeAudit(user_id, 'wallet.activate', { wallet_id });
+    res.json({ ok: true, wallet_id });
+  } catch (e: any) {
+    res.status(400).json({ error: e?.message || String(e) });
+  }
 });
 
 // Admin endpoints for withdrawals
@@ -178,15 +431,32 @@ app.get('/wallets/:wallet_id/estimate', async (req, res) => {
   res.json({ solAmount, lamports, feeBufferSol, feeBufferLamports, balance_sol, balance_usd });
 });
 
-// Terminal: quote simulation
+// Terminal: buy quote (real routing only; no simulated fallback)
 app.post('/terminal/buy/quote', async (req, res) => {
-  const { inputMint, outputMint, amount_usd, slippageBps } = req.body;
-  // Simple simulated quote
-  const expectedOut = Number(amount_usd) * 1.0; // placeholder 1 USD -> 1 unit
-  const priceImpact = Math.min(5, Math.random() * 2);
-  const fees = Math.max(0.1, Number(amount_usd) * 0.003);
-  const quote = { expectedOut, priceImpact, fees, slippageBps };
-  res.json({ quote });
+  const { inputMint = 'SOL', outputMint, amount_usd, slippageBps = 100 } = req.body;
+  const amountUsd = Number(amount_usd || 0);
+  if (!outputMint || amountUsd <= 0) return res.status(400).json({ error: 'invalid_quote_request' });
+
+  if (process.env.USE_JUPITER !== 'true') return res.status(503).json({ error: 'routing_disabled_use_jupiter_false' });
+
+  const lamportsIn = Math.max(1, Math.round(amountUsd * 1_000_000_000));
+  const jup = await getJupiterQuote(inputMint, outputMint, lamportsIn, Number(slippageBps || 100));
+  if (!jup) return res.status(503).json({ error: 'quote_unavailable' });
+  const route = Array.isArray(jup?.data) ? jup.data[0] : null;
+  if (!route) return res.status(503).json({ error: 'route_unavailable' });
+  const expectedOutRaw = route?.outAmount || route?.out_amount || route?.amountOut || null;
+  const priceImpactPct = Number(route?.priceImpactPct ?? route?.price_impact_pct ?? 0);
+  const expectedOut = expectedOutRaw ? Number(expectedOutRaw) : null;
+  return res.json({
+    quote: {
+      provider: 'jupiter',
+      expectedOut,
+      expectedOutRaw,
+      priceImpactPct,
+      slippageBps: Number(slippageBps || 100),
+      route
+    }
+  });
 });
 
 // Helper: check subscription entitlement
@@ -201,11 +471,12 @@ async function hasEntitlement(userId: string, entitlement: 'meme_pro' | 'forex_p
 
 // Terminal: execute buy with idempotency, gating, pin check, risk checks
 app.post('/terminal/buy/execute', async (req, res) => {
-  const { user_id, wallet_id, mint, amount_usd, idempotency_key, slippage_bps, exec_mode, shield, pin } = req.body;
-  // idempotency
-  const existed = await query('SELECT 1 FROM idempotency_keys WHERE key_value=$1', [idempotency_key]);
-  if (existed.rowCount > 0) return res.status(409).json({ error: 'duplicate' });
-  await query('INSERT INTO idempotency_keys(id, key_value, created_at) VALUES($1,$2,now())', [uuidv4(), idempotency_key]);
+  try {
+    const { user_id, wallet_id, mint, amount_usd, idempotency_key, slippage_bps, exec_mode, shield, pin } = req.body;
+    // idempotency
+    const existed = await query('SELECT 1 FROM idempotency_keys WHERE key_value=$1', [idempotency_key]);
+    if (existed.rowCount > 0) return res.status(409).json({ error: 'duplicate' });
+    await query('INSERT INTO idempotency_keys(id, key_value, created_at) VALUES($1,$2,now())', [uuidv4(), idempotency_key]);
 
   // subscription/risk gating
   const allowed = await hasEntitlement(user_id, 'terminal');
@@ -233,23 +504,34 @@ app.post('/terminal/buy/execute', async (req, res) => {
     return res.status(400).json({ error: e.message });
   }
 
+  let resolvedWalletId = wallet_id;
+  if (!resolvedWalletId) {
+    const wr = await query('SELECT id FROM wallets WHERE user_id=$1 AND is_active=true ORDER BY created_at DESC LIMIT 1', [user_id]);
+    if (wr.rowCount === 0) return res.status(400).json({ error: 'wallet_required_no_active_wallet' });
+    resolvedWalletId = wr.rows[0].id;
+  }
+
   const tradeId = uuidv4();
   await query(
-    `INSERT INTO sol_trades(id, user_id, wallet_id, mint, side, amount_in_usd, status, created_at, updated_at)
-     VALUES($1,$2,$3,$4,'buy',$5,'queued',now(),now())`,
-    [tradeId, user_id, wallet_id, mint, amount_usd]
+    `INSERT INTO sol_trades(id, user_id, wallet_id, mint, side, amount_in_usd, status, meta, created_at, updated_at)
+     VALUES($1,$2,$3,$4,'buy',$5,'queued',$6,now(),now())`,
+    [tradeId, user_id, resolvedWalletId, mint, amount_usd, JSON.stringify({ slippage_bps, exec_mode, shield })]
   );
-  await writeAudit(user_id, 'terminal.buy.request', { tradeId, mint, amount_usd, exec_mode, shield, slippage_bps });
-  res.json({ tradeId, status: 'queued' });
+    await writeAudit(user_id, 'terminal.buy.request', { tradeId, mint, amount_usd, exec_mode, shield, slippage_bps });
+    res.json({ tradeId, status: 'queued' });
+  } catch (e: any) {
+    return res.status(503).json({ error: 'database_unavailable', detail: String(e?.message || e) });
+  }
 });
 
 // Terminal: execute sell
 app.post('/terminal/sell/execute', async (req, res) => {
-  const { user_id, position_id, percent, idempotency_key, slippage_bps, exec_mode, shield, pin } = req.body;
-  // idempotency
-  const existed = await query('SELECT 1 FROM idempotency_keys WHERE key_value=$1', [idempotency_key]);
-  if (existed.rowCount > 0) return res.status(409).json({ error: 'duplicate' });
-  await query('INSERT INTO idempotency_keys(id, key_value, created_at) VALUES($1,$2,now())', [uuidv4(), idempotency_key]);
+  try {
+    const { user_id, position_id, percent, idempotency_key, slippage_bps, exec_mode, shield, pin } = req.body;
+    // idempotency
+    const existed = await query('SELECT 1 FROM idempotency_keys WHERE key_value=$1', [idempotency_key]);
+    if (existed.rowCount > 0) return res.status(409).json({ error: 'duplicate' });
+    await query('INSERT INTO idempotency_keys(id, key_value, created_at) VALUES($1,$2,now())', [uuidv4(), idempotency_key]);
 
   // entitlement
   const allowed = await hasEntitlement(user_id, 'terminal');
@@ -284,43 +566,68 @@ app.post('/terminal/sell/execute', async (req, res) => {
   await query(
     `INSERT INTO sol_trades(id, user_id, wallet_id, mint, side, amount_in_usd, status, position_id, meta, created_at, updated_at)
      VALUES($1,$2,$3,$4,'sell',$5,'queued',$6,$7,now(),now())`,
-    [tradeId, user_id, pos.wallet_id, pos.mint, amountUsd, position_id, JSON.stringify({ percent: pct })]
+    [tradeId, user_id, pos.wallet_id, pos.mint, amountUsd, position_id, JSON.stringify({ percent: pct, slippage_bps, exec_mode, shield })]
   );
-  await writeAudit(user_id, 'terminal.sell.request', { tradeId, position_id, percent, amountUsd, exec_mode, shield, slippage_bps });
-  res.json({ tradeId, status: 'queued' });
+    await writeAudit(user_id, 'terminal.sell.request', { tradeId, position_id, percent, amountUsd, exec_mode, shield, slippage_bps });
+    res.json({ tradeId, status: 'queued' });
+  } catch (e: any) {
+    return res.status(503).json({ error: 'database_unavailable', detail: String(e?.message || e) });
+  }
 });
 
 // Orders endpoints: create/list/cancel
 app.post('/orders', async (req, res) => {
-  const { user_id, wallet_id, type, mint, params } = req.body;
-  // Basic validations for order types
-  if (type === 'limit' || type === 'dca') {
-    const amount = params?.amount_usd ?? null;
-    if (!amount || Number(amount) < 10) {
-      return res.status(400).json({ error: 'minimum_order_amount_10_required' });
-    }
-  }
-  const id = uuidv4();
   try {
+    const { user_id, wallet_id, type, mint, params } = req.body;
+    // Basic validations for order types
+    if (type === 'limit' || type === 'dca') {
+      const amount = params?.amount_usd ?? null;
+      if (!amount || Number(amount) < 10) {
+        return res.status(400).json({ error: 'minimum_order_amount_10_required' });
+      }
+    }
+    const id = uuidv4();
     if (type === 'limit' || type === 'dca') await enforceAll(user_id, Number(params.amount_usd || 0));
+    await query('INSERT INTO orders(id,user_id,wallet_id,type,mint,params,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,now())', [id, user_id, wallet_id, type, mint, params, 'open']);
+    await writeAudit(user_id, 'orders.create', { id, type, mint });
+    res.json({ id });
   } catch (e: any) {
-    return res.status(400).json({ error: e.message });
+    if (e?.message) return res.status(400).json({ error: e.message });
+    return res.status(503).json({ error: 'database_unavailable', detail: String(e?.message || e) });
   }
-  await query('INSERT INTO orders(id,user_id,wallet_id,type,mint,params,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,now())', [id, user_id, wallet_id, type, mint, params, 'open']);
-  await writeAudit(user_id, 'orders.create', { id, type, mint });
-  res.json({ id });
 });
 
-// Payments / Subscriptions: simple activation endpoint (for demo)
 app.post('/subscriptions/activate', async (req, res) => {
   const { user_id, plan, months = 1, reference } = req.body;
+  const normalizedPlan = normalizePlan(plan);
+  if (!user_id) return res.status(400).json({ error: 'user_id_required' });
+  if (!normalizedPlan) return res.status(400).json({ error: 'invalid_plan', allowed: ['meme', 'forex', 'bundle'] });
+  const monthsN = Number(months || 1);
+  if (!Number.isInteger(monthsN) || monthsN <= 0 || monthsN > 12) return res.status(400).json({ error: 'invalid_months' });
+
   const id = uuidv4();
   const now = new Date();
-  const active_until = new Date(now.getTime() + months * 30 * 24 * 60 * 60 * 1000).toISOString();
-  await query('INSERT INTO payments(id,user_id,amount_usd,method,reference,status,created_at) VALUES($1,$2,$3,$4,$5,$6,now())', [uuidv4(), user_id, 100 * months, 'manual', reference || null, 'received']);
-  await query('INSERT INTO subscriptions(id,user_id,plan,status,active_until,created_at,updated_at) VALUES($1,$2,$3,$4,$5,now(),now()) ON CONFLICT (id) DO UPDATE SET plan=EXCLUDED.plan, status=EXCLUDED.status, active_until=EXCLUDED.active_until, updated_at=now()', [id, user_id, plan, 'active', active_until]);
-  await writeAudit(user_id, 'subscription.activate', { plan, months, active_until });
-  res.json({ id, active_until });
+  const active_until = new Date(now.getTime() + monthsN * 30 * 24 * 60 * 60 * 1000).toISOString();
+  const expectedAmount = Number(SUBSCRIPTION_PRICES[normalizedPlan]) * monthsN;
+  await query('INSERT INTO payments(id,user_id,amount_usd,method,reference,status,created_at) VALUES($1,$2,$3,$4,$5,$6,now())', [uuidv4(), user_id, expectedAmount, 'manual', reference || null, 'received']);
+  await query('UPDATE subscriptions SET status=$1, updated_at=now() WHERE user_id=$2 AND status=$3', ['expired', user_id, 'active']);
+  await query('INSERT INTO subscriptions(id,user_id,plan,status,active_until,created_at,updated_at) VALUES($1,$2,$3,$4,$5,now(),now())', [id, user_id, normalizedPlan, 'active', active_until]);
+  await writeAudit(user_id, 'subscription.activate', { plan: normalizedPlan, months: monthsN, expectedAmount, active_until, reference: reference || null });
+  res.json({ id, active_until, plan: normalizedPlan, amount_usd: expectedAmount });
+});
+
+app.get('/subscriptions/status/:user_id', async (req, res) => {
+  const { user_id } = req.params;
+  const s = await query('SELECT plan, status, active_until FROM subscriptions WHERE user_id=$1 ORDER BY active_until DESC LIMIT 1', [user_id]);
+  if (s.rowCount === 0) return res.json({ active: false, entitlements: { terminal: true, meme_pro: false, forex_pro: false } });
+  const row = s.rows[0];
+  const active = new Date(row.active_until) > new Date() && row.status === 'active';
+  const entitlements = {
+    terminal: true,
+    meme_pro: active && (row.plan === 'meme' || row.plan === 'bundle'),
+    forex_pro: active && (row.plan === 'forex' || row.plan === 'bundle')
+  };
+  res.json({ active, subscription: row, entitlements });
 });
 
 app.get('/orders/:user_id', async (req, res) => {
@@ -341,9 +648,12 @@ app.get('/positions/:id', async (req, res) => {
 // Copy trade: create a copy order
 app.post('/copy_trade', async (req, res) => {
   const { user_id, source, mint, amount_usd } = req.body;
+  if (!source || String(source).trim().length < 3) return res.status(400).json({ error: 'source_required' });
+  const amt = Number(amount_usd || 0);
+  if (amt > 0 && amt < 10) return res.status(400).json({ error: 'minimum_copy_amount_10_required' });
   const id = uuidv4();
-  await query('INSERT INTO orders(id,user_id,wallet_id,type,mint,params,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,now())', [id, user_id, null, 'copy', mint || null, JSON.stringify({ source, amount_usd }), 'open']);
-  await writeAudit(user_id, 'copy_trade.create', { id, source, mint, amount_usd });
+  await query('INSERT INTO orders(id,user_id,wallet_id,type,mint,params,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,now())', [id, user_id, null, 'copy', mint || null, JSON.stringify({ source, amount_usd: amt > 0 ? amt : null }), 'open']);
+  await writeAudit(user_id, 'copy_trade.create', { id, source, mint, amount_usd: amt > 0 ? amt : null });
   res.json({ id });
 });
 
@@ -436,6 +746,24 @@ app.post('/terminal/settings/:user_id', async (req, res) => {
   res.json({ ok: true });
 });
 
+
+
+// EA bind/register terminal token for a user
+app.post('/ea/bind', async (req, res) => {
+  const { user_id, platform = 'mt5', terminal_id, token } = req.body;
+  if (!user_id || !terminal_id || !token) return res.status(400).json({ error: 'user_id_terminal_id_token_required' });
+  const id = uuidv4();
+  await query(
+    `INSERT INTO ea_terminals(id,user_id,platform,terminal_id,token_hash,status,last_seen_at)
+     VALUES($1,$2,$3,$4,$5,$6,now())
+     ON CONFLICT (terminal_id)
+     DO UPDATE SET user_id=EXCLUDED.user_id, platform=EXCLUDED.platform, token_hash=EXCLUDED.token_hash, status=EXCLUDED.status, last_seen_at=now()`,
+    [id, user_id, platform, terminal_id, token, 'active']
+  );
+  await writeAudit(user_id, 'ea.bind', { terminal_id, platform });
+  res.json({ ok: true, terminal_id });
+});
+
 // Endpoint: EA poll (Forex) - implements subscription + risk gating
 app.post('/ea/poll', async (req, res) => {
   const { terminal_id, token, equity } = req.body;
@@ -486,19 +814,31 @@ app.post('/ea/report', async (req, res) => {
   res.json({ ok: true });
 });
 
-// Webhook: payment notifications (e.g., from payment provider)
+// Webhook: payment notifications
 app.post('/webhooks/payments', async (req, res) => {
-  const { reference, user_id, amount_usd, status } = req.body;
-  // basic validation
+  const { reference, user_id, amount_usd, status, plan = null, months = 1 } = req.body;
   if (!reference || !user_id) return res.status(400).json({ error: 'invalid' });
-  await query('INSERT INTO payments(id,user_id,amount_usd,method,reference,status,created_at) VALUES($1,$2,$3,$4,$5,$6,now())', [uuidv4(), user_id, amount_usd || 0, 'webhook', reference, status || 'pending']);
-  // if payment received, activate subscription automatically (demo behavior)
+  const normalizedPlan = plan ? normalizePlan(plan) : null;
+  const monthsN = Number(months || 1);
+  const amountN = Number(amount_usd || 0);
+
+  await query('INSERT INTO payments(id,user_id,amount_usd,method,reference,status,created_at) VALUES($1,$2,$3,$4,$5,$6,now())', [uuidv4(), user_id, amountN, 'webhook', reference, status || 'pending']);
+
   if (status === 'received' || status === 'confirmed') {
+    if (!normalizedPlan) return res.status(400).json({ error: 'plan_required_for_activation' });
+    if (!Number.isInteger(monthsN) || monthsN <= 0 || monthsN > 12) return res.status(400).json({ error: 'invalid_months' });
+    const expectedAmount = Number(SUBSCRIPTION_PRICES[normalizedPlan]) * monthsN;
+    if (Math.abs(amountN - expectedAmount) > 0.000001) {
+      await writeAudit(user_id, 'webhook.payment.mismatch', { reference, amount_usd: amountN, expectedAmount, plan: normalizedPlan, months: monthsN });
+      return res.status(400).json({ error: 'amount_mismatch', expected_amount_usd: expectedAmount });
+    }
+
     const subId = uuidv4();
     const now = new Date();
-    const active_until = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
-    await query('INSERT INTO subscriptions(id,user_id,plan,status,active_until,created_at,updated_at) VALUES($1,$2,$3,$4,$5,now(),now())', [subId, user_id, 'meme', 'active', active_until]);
-    await writeAudit(user_id, 'webhook.payment.activated', { reference, active_until });
+    const active_until = new Date(now.getTime() + monthsN * 30 * 24 * 60 * 60 * 1000).toISOString();
+    await query('UPDATE subscriptions SET status=$1, updated_at=now() WHERE user_id=$2 AND status=$3', ['expired', user_id, 'active']);
+    await query('INSERT INTO subscriptions(id,user_id,plan,status,active_until,created_at,updated_at) VALUES($1,$2,$3,$4,$5,now(),now())', [subId, user_id, normalizedPlan, 'active', active_until]);
+    await writeAudit(user_id, 'webhook.payment.activated', { reference, active_until, plan: normalizedPlan, months: monthsN, amount_usd: amountN });
   }
   res.json({ ok: true });
 });

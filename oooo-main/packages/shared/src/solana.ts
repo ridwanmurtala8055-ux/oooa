@@ -4,12 +4,34 @@ import { decryptPrivateKey } from './crypto';
 import { query } from './db';
 
 const JUPITER_API = process.env.JUPITER_API_URL || 'https://quote-api.jup.ag/v6';
-const SOLANA_RPC = process.env.SOLANA_RPC_URL || 'https://api.mainnet-beta.solana.com';
+const DEFAULT_MAINNET_RPC = 'https://api.mainnet-beta.solana.com';
+const DEFAULT_DEVNET_RPC = 'https://api.devnet.solana.com';
 const JITO_RELAY = process.env.JITO_RELAY_URL || null;
+
+function getCluster() {
+  return String(process.env.SOLANA_CLUSTER || 'mainnet').toLowerCase();
+}
+
+function getSolanaRpcUrl() {
+  if (process.env.SOLANA_RPC_URL && String(process.env.SOLANA_RPC_URL).trim()) return String(process.env.SOLANA_RPC_URL).trim();
+  return getCluster() === 'devnet' ? DEFAULT_DEVNET_RPC : DEFAULT_MAINNET_RPC;
+}
+const WSOL_MINT = 'So11111111111111111111111111111111111111112';
+
+function normalizeMint(mint: string) {
+  const v = String(mint || '').trim();
+  if (!v) return v;
+  if (v.toUpperCase() === 'SOL') return WSOL_MINT;
+  return v;
+}
 
 export async function getJupiterQuote(inputMint: string, outputMint: string, amount: number, slippageBps = 100) {
   try {
-    const url = `${JUPITER_API}/quote?inputMint=${encodeURIComponent(inputMint)}&outputMint=${encodeURIComponent(outputMint)}&amount=${amount}&slippageBps=${slippageBps}`;
+    const inMint = normalizeMint(inputMint);
+    const outMint = normalizeMint(outputMint);
+    const safeAmount = Math.max(1, Math.floor(Number(amount || 0)));
+    const safeSlippage = Math.max(1, Math.floor(Number(slippageBps || 100)));
+    const url = `${JUPITER_API}/quote?inputMint=${encodeURIComponent(inMint)}&outputMint=${encodeURIComponent(outMint)}&amount=${safeAmount}&slippageBps=${safeSlippage}`;
     const r = await fetch(url);
     if (!r.ok) throw new Error('jupiter_quote_failed');
     const j: any = await r.json();
@@ -86,7 +108,7 @@ export async function getSolPriceUsd() {
 
 export async function getBalancePublicKey(pubkey: string, connection?: Connection) {
   try {
-    const conn = connection || new Connection(process.env.SOLANA_RPC || 'https://api.devnet.solana.com');
+    const conn = connection || new Connection(getSolanaRpcUrl());
     const pk = new PublicKey(pubkey);
     const lamports = await conn.getBalance(pk);
     return lamports / LAMPORTS_PER_SOL;
@@ -97,7 +119,7 @@ export async function getBalancePublicKey(pubkey: string, connection?: Connectio
 
 export async function estimateTransferFee(opts: { fromPubkey: string; toPubkey: string; connection?: Connection; lamports?: number }) {
   try {
-    const conn = opts.connection || new Connection(process.env.SOLANA_RPC || 'https://api.devnet.solana.com');
+    const conn = opts.connection || new Connection(getSolanaRpcUrl());
     const from = new PublicKey(opts.fromPubkey);
     const to = new PublicKey(opts.toPubkey);
     const lamports = opts.lamports || 1;
@@ -125,7 +147,7 @@ export async function estimateTransferFee(opts: { fromPubkey: string; toPubkey: 
 
 // Send a SOL transfer for the given wallet. amountUsd is converted to lamports using price feed.
 export async function sendSolTransfer(opts: { walletId: string; userId: string; destination: string; amountUsd: number; connection?: Connection }) {
-  const conn = opts.connection || new Connection(process.env.SOLANA_RPC || 'https://api.devnet.solana.com');
+  const conn = opts.connection || new Connection(getSolanaRpcUrl());
   const r = await query('SELECT enc_privkey, enc_iv, enc_tag FROM wallets WHERE id=$1', [opts.walletId]);
   if (r.rowCount === 0) throw new Error('wallet_not_found');
   const row = r.rows[0];
@@ -174,7 +196,7 @@ export async function sendSolTransfer(opts: { walletId: string; userId: string; 
 // Build and send swap using either a prebuilt transaction present in the quote
 // or a best-effort public send. Returns { signature, method } on success.
 export async function buildAndSendSwap(opts: { walletId: string; userId: string; quote: any; useJito?: boolean; connection?: Connection }) {
-  const conn = opts.connection || new Connection(SOLANA_RPC);
+  const conn = opts.connection || new Connection(getSolanaRpcUrl());
   const r = await query('SELECT enc_privkey, enc_iv, enc_tag FROM wallets WHERE id=$1', [opts.walletId]);
   if (r.rowCount === 0) throw new Error('wallet_not_found');
   const row = r.rows[0];
@@ -220,12 +242,36 @@ export async function buildAndSendSwap(opts: { walletId: string; userId: string;
           throw simErr;
         }
 
-        // If shield/Jito requested, placeholder for relay send
-        if (opts.useJito && JITO_RELAY) {
-          // TODO: implement Jito relay bundle send. For now, log intent and fall back to normal send.
+        if (opts.useJito) {
+          if (!JITO_RELAY) {
+            await query('INSERT INTO engine_events(id, user_id, engine, level, message, payload_json, created_at) VALUES($1,$2,$3,$4,$5,$6,now())', [
+              require('uuid').v4(), opts.userId, 'solana', 'error', 'jito_requested_without_relay', JSON.stringify({ configured: false })
+            ]).catch(() => null);
+            throw new Error('jito_relay_not_configured');
+          }
+          // Strict mode: if Shield/Jito is requested, use relay-only path.
+          const signedRaw = tx.serialize({ requireAllSignatures: false });
+          const jr = await fetch(JITO_RELAY, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ tx: signedRaw.toString('base64'), user_id: opts.userId, wallet_id: opts.walletId })
+          });
+          if (!jr.ok) {
+            const body = await jr.text().catch(() => '');
+            await query('INSERT INTO engine_events(id, user_id, engine, level, message, payload_json, created_at) VALUES($1,$2,$3,$4,$5,$6,now())', [
+              require('uuid').v4(), opts.userId, 'solana', 'error', 'jito_send_failed', JSON.stringify({ status: jr.status, body })
+            ]).catch(() => null);
+            throw new Error('jito_send_failed');
+          }
+          const out: any = await jr.json().catch(() => ({}));
+          const relaySig = out?.signature || out?.txid || out?.result || null;
+          if (!relaySig || typeof relaySig !== 'string') {
+            throw new Error('jito_signature_missing');
+          }
           await query('INSERT INTO engine_events(id, user_id, engine, level, message, payload_json, created_at) VALUES($1,$2,$3,$4,$5,$6,now())', [
-            require('uuid').v4(), opts.userId, 'solana', 'info', 'jito_requested', JSON.stringify({ relay: JITO_RELAY })
+            require('uuid').v4(), opts.userId, 'solana', 'info', 'swap_sent', JSON.stringify({ method: 'jito', sig: relaySig, relay: JITO_RELAY })
           ]).catch(() => null);
+          return { signature: relaySig, method: 'jito' };
         }
 
         const sig = await sendAndConfirmTransaction(conn, tx, [kp]);
