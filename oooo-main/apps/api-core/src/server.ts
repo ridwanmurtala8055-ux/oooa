@@ -6,8 +6,45 @@ import { v4 as uuidv4 } from 'uuid';
 const app = express();
 app.use(bodyParser.json());
 
+
+function computeReadiness() {
+  const required = {
+    infrastructure: ['DATABASE_URL'],
+    security: ['WALLET_MASTER_KEY', 'PIN_HASH_PEPPER'],
+    telegram: ['TELEGRAM_BOT_TOKEN'],
+    solana: ['SOLANA_RPC_URL'],
+    execution: ['USE_JUPITER'],
+    forex: ['EA_SHARED_SECRET'],
+    payments: ['PAYMENT_RECEIVER_WALLET']
+  } as const;
+
+  const missing: Record<string, string[]> = {};
+  for (const [group, keys] of Object.entries(required)) {
+    const missed = keys.filter((k) => !(process.env[k] && String(process.env[k]).trim().length > 0));
+    if (missed.length) missing[group] = missed;
+  }
+
+  const warnings: string[] = [];
+  if (process.env.USE_JUPITER !== 'true') warnings.push('USE_JUPITER is not true; swap execution may remain in simulation/fallback mode.');
+  if ((process.env.SHIELD_MODE || 'false') !== 'true') warnings.push('SHIELD_MODE is disabled; private relay MEV protection is off.');
+
+  return {
+    ok: Object.keys(missing).length === 0,
+    missing,
+    warnings,
+    required
+  };
+}
+
 // Health
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// Readiness endpoint for deployment validation
+app.get('/admin/readiness', async (_req, res) => {
+  const readiness = computeReadiness();
+  res.status(readiness.ok ? 200 : 503).json(readiness);
+});
+
 
 // Create user (minimal)
 app.post('/users', async (req, res) => {
@@ -68,7 +105,24 @@ app.get('/terminal/screens/:user_id', async (req, res) => {
     SCREEN_MAIN: { title: 'Terminal', buttons: ['Buy','Sell','Positions','Orders','Wallets','Settings'] },
     SCREEN_BUY_INPUT: { title: 'Buy Token', fields: ['mint'] },
     SCREEN_BUY_PANEL: { title: 'Buy Panel', controls: ['presets','custom_amount','slippage','exec_mode','shield','confirm'] },
-    SCREEN_POSITIONS: { title: 'Positions' }
+    SCREEN_BUY_SETTINGS: { title: 'Buy Settings' },
+    SCREEN_BUY_SLIPPAGE: { title: 'Buy Slippage' },
+    SCREEN_EXECUTION_MODE: { title: 'Execution Mode' },
+    SCREEN_SHIELD_MODE: { title: 'Shield Mode' },
+    SCREEN_BUY_PRESETS: { title: 'Buy Presets' },
+    SCREEN_POSITIONS: { title: 'Positions' },
+    SCREEN_SELL_PANEL: { title: 'Sell Panel' },
+    SCREEN_SELL_SETTINGS: { title: 'Sell Settings' },
+    SCREEN_SELL_SLIPPAGE: { title: 'Sell Slippage' },
+    SCREEN_ORDERS_MAIN: { title: 'Orders' },
+    SCREEN_LIMIT_ORDERS: { title: 'Limit Orders' },
+    SCREEN_DCA_ORDERS: { title: 'DCA Orders' },
+    SCREEN_SNIPER_MAIN: { title: 'Sniper' },
+    SCREEN_COPY_MAIN: { title: 'Copy Trade' },
+    SCREEN_WALLET_MAIN: { title: 'Wallets' },
+    SCREEN_WITHDRAW_FLOW: { title: 'Withdraw' },
+    SCREEN_SECURITY_MAIN: { title: 'Security' },
+    SCREEN_SETTINGS_MAIN: { title: 'Settings' }
   };
   await writeAudit(user_id, 'terminal.screens.view', { screens: Object.keys(screens) });
   res.json({ screens });
@@ -323,6 +377,20 @@ app.post('/subscriptions/activate', async (req, res) => {
   res.json({ id, active_until });
 });
 
+app.get('/subscriptions/status/:user_id', async (req, res) => {
+  const { user_id } = req.params;
+  const s = await query('SELECT plan, status, active_until FROM subscriptions WHERE user_id=$1 ORDER BY active_until DESC LIMIT 1', [user_id]);
+  if (s.rowCount === 0) return res.json({ active: false, entitlements: { terminal: true, meme_pro: false, forex_pro: false } });
+  const row = s.rows[0];
+  const active = new Date(row.active_until) > new Date() && row.status === 'active';
+  const entitlements = {
+    terminal: true,
+    meme_pro: active && (row.plan === 'meme' || row.plan === 'bundle'),
+    forex_pro: active && (row.plan === 'forex' || row.plan === 'bundle')
+  };
+  res.json({ active, subscription: row, entitlements });
+});
+
 app.get('/orders/:user_id', async (req, res) => {
   const { user_id } = req.params;
   const r = await query('SELECT * FROM orders WHERE user_id=$1', [user_id]);
@@ -434,6 +502,24 @@ app.post('/terminal/settings/:user_id', async (req, res) => {
   await query('INSERT INTO terminal_settings(user_id,buy_slippage_bps,sell_slippage_bps,exec_mode,shield_enabled,confirm_trades,presets_json,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,now()) ON CONFLICT (user_id) DO UPDATE SET buy_slippage_bps=EXCLUDED.buy_slippage_bps, sell_slippage_bps=EXCLUDED.sell_slippage_bps, exec_mode=EXCLUDED.exec_mode, shield_enabled=EXCLUDED.shield_enabled, confirm_trades=EXCLUDED.confirm_trades, presets_json=EXCLUDED.presets_json, updated_at=now()', [user_id, buy_slippage_bps, sell_slippage_bps, exec_mode, shield_enabled, confirm_trades, presets_json]);
   await writeAudit(user_id, 'terminal.settings.update', {});
   res.json({ ok: true });
+});
+
+
+
+// EA bind/register terminal token for a user
+app.post('/ea/bind', async (req, res) => {
+  const { user_id, platform = 'mt5', terminal_id, token } = req.body;
+  if (!user_id || !terminal_id || !token) return res.status(400).json({ error: 'user_id_terminal_id_token_required' });
+  const id = uuidv4();
+  await query(
+    `INSERT INTO ea_terminals(id,user_id,platform,terminal_id,token_hash,status,last_seen_at)
+     VALUES($1,$2,$3,$4,$5,$6,now())
+     ON CONFLICT (terminal_id)
+     DO UPDATE SET user_id=EXCLUDED.user_id, platform=EXCLUDED.platform, token_hash=EXCLUDED.token_hash, status=EXCLUDED.status, last_seen_at=now()`,
+    [id, user_id, platform, terminal_id, token, 'active']
+  );
+  await writeAudit(user_id, 'ea.bind', { terminal_id, platform });
+  res.json({ ok: true, terminal_id });
 });
 
 // Endpoint: EA poll (Forex) - implements subscription + risk gating
