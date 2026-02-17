@@ -11,8 +11,8 @@
   },
   "scripts": {
     "bootstrap": "pnpm install",
-    "start:api": "pnpm --filter @coinhunter/api-core --workspace-root run dev",
-    "start:bot": "pnpm --filter @coinhunter/bot-telegram --workspace-root run dev",
+    "start:api": "bash -lc 'set -a; [ -f .env ] && source .env; set +a; pnpm run build:shared && pnpm --filter @coinhunter/api-core --workspace-root run dev'",
+    "start:bot": "bash -lc 'set -a; [ -f .env ] && source .env; set +a; pnpm run build:shared && pnpm --filter @coinhunter/bot-telegram --workspace-root run dev'",
     "migrate": "sh infra/migrate.sh",
     "compose:up": "docker-compose -f infra/docker-compose.yml up --build",
     "test": "node tests/run.js",
@@ -20,6 +20,8 @@
     "test:solana": "node tests/solana_swap_test.js",
     "devnet:test": "node tests/devnet_integration.js",
     "check:secrets": "node scripts/check_secrets.js",
-    "unit:test": "node -r ts-node/register tests/shared.test.ts"
+    "unit:test": "TS_NODE_COMPILER_OPTIONS='{\"module\":\"CommonJS\",\"moduleResolution\":\"node\"}' node -r ts-node/register/transpile-only tests/shared.test.cjs",
+    "env:generate": "node scripts/generate_env.js",
+    "build:shared": "pnpm --filter @coinhunter/shared --workspace-root run build"
   }
 }

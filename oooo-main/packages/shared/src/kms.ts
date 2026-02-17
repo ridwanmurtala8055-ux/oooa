@@ -9,7 +9,7 @@ export async function getSecret(name: string) {
     try {
       const r = await fetch(`${kmsEndpoint}/secrets/${encodeURIComponent(name)}`);
       if (r.ok) {
-        const j = await r.json();
+        const j: any = await r.json();
         if (j && j.value) return j.value;
       }
     } catch (e) {
